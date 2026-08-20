@@ -870,6 +870,28 @@ def _get_plugin_toolset_names() -> Set[str]:
         return set()
 
 
+def _get_cached_plugin_toolset_names() -> Set[str]:
+    """Return toolset names persisted by the previous plugin discovery run.
+
+    Used as a non-blocking fallback during early startup (before plugin
+    discovery has finished) so CLI toolset validation can recognise
+    plugin-provided toolsets without waiting for the live registry.
+    """
+    try:
+        import json as _json
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "cache" / "plugin_toolset_keys.json"
+        blob = _json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(blob, dict):
+            keys = blob.get("toolset_keys")
+            if isinstance(keys, list) and all(isinstance(k, str) for k in keys):
+                return {k for k in keys if k not in TOOLSETS}
+    except Exception:
+        pass
+    return set()
+
+
 def _get_registry_toolset_aliases() -> Dict[str, str]:
     """Return explicit toolset aliases registered in the live registry."""
     try:
@@ -943,6 +965,8 @@ def validate_toolset(name: str) -> bool:
     if name in TOOLSETS:
         return True
     if name in _get_plugin_toolset_names():
+        return True
+    if name in _get_cached_plugin_toolset_names():
         return True
     return name in _get_registry_toolset_aliases()
 

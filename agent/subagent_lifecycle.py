@@ -524,9 +524,9 @@ class SubagentLifecycleService:
         if metadata_bytes > _MAX_METADATA_BYTES:
             raise SubagentLifecycleError("metadata exceeds 8192 bytes.")
         if request.allowed_toolsets:
-            from toolsets import TOOLSETS
+            from toolsets import validate_toolset
 
-            unknown = set(request.allowed_toolsets) - set(TOOLSETS)
+            unknown = {ts for ts in request.allowed_toolsets if not validate_toolset(ts)}
             if unknown:
                 raise SubagentLifecycleError(
                     f"Unknown toolsets: {', '.join(sorted(unknown))}."

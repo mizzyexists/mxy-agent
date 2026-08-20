@@ -83,30 +83,40 @@ def _repair_schema(node: Any, is_schema: bool = True) -> Any:
     if not is_schema:
         return repaired
 
-    # Rule 2: when anyOf is present, type belongs only on the children.
-    # Additionally, Moonshot rejects null-type branches inside anyOf
-    # (enum value (<nil>) does not match any type in [string]).
-    # Collapse the anyOf to the first non-null branch and infer its type.
-    if "anyOf" in repaired and isinstance(repaired["anyOf"], list):
+    # Rule 2: when anyOf/oneOf/allOf is present, type belongs only on the
+    # children.  Fireworks-hosted Kimi also rejects a parent ``type`` merged
+    # against combinator branches (HTTP 400: Conflict in schema definitions
+    # for key 'type').  Additionally, Moonshot rejects null-type branches
+    # inside anyOf/oneOf (enum value (<nil>) does not match any type in
+    # [string]).  Collapse nullable unions to the non-null branch(es).
+    combinator_key = next(
+        (key for key in ("anyOf", "oneOf", "allOf") if key in repaired),
+        None,
+    )
+    if combinator_key and isinstance(repaired[combinator_key], list):
         repaired.pop("type", None)
-        non_null = [b for b in repaired["anyOf"]
-                    if isinstance(b, dict) and b.get("type") != "null"]
-        if non_null and len(non_null) < len(repaired["anyOf"]):
-            # Drop the anyOf wrapper — keep only the non-null branch.
-            # If there's a single non-null branch, promote it and fall
-            # through to Rules 1/3 so nullable/enum cleanup still applies
-            # to the merged node.
-            if len(non_null) == 1:
-                merge = {k: v for k, v in repaired.items() if k != "anyOf"}
-                merge.update(non_null[0])
-                repaired = merge
+        if combinator_key in {"anyOf", "oneOf"}:
+            non_null = [
+                b for b in repaired[combinator_key]
+                if isinstance(b, dict) and b.get("type") != "null"
+            ]
+            if non_null and len(non_null) < len(repaired[combinator_key]):
+                # Drop the combinator wrapper — keep only the non-null branch.
+                # If there's a single non-null branch, promote it and fall
+                # through to Rules 1/3 so nullable/enum cleanup still applies
+                # to the merged node.
+                if len(non_null) == 1:
+                    merge = {k: v for k, v in repaired.items() if k != combinator_key}
+                    merge.update(non_null[0])
+                    repaired = merge
+                else:
+                    repaired[combinator_key] = non_null
+                    return repaired
             else:
-                repaired["anyOf"] = non_null
+                # Nothing to collapse — parent type stripped, children already
+                # repaired by the recursive walk above.
                 return repaired
-        else:
-            # Nothing to collapse — parent type stripped, children already
-            # repaired by the recursive walk above.
-            return repaired
+        return repaired
 
     # Moonshot also rejects non-standard keywords like ``nullable`` on
     # parameter schemas — strip it.
@@ -205,6 +215,12 @@ def sanitize_moonshot_tool_parameters(parameters: Any) -> Dict[str, Any]:
     repaired = _repair_schema(copy.deepcopy(parameters), is_schema=True)
     if not isinstance(repaired, dict):
         return {"type": "object", "properties": {}, "required": []}
+
+    # Strict OpenAI-compatible backends (Fireworks Kimi, Codex) reject
+    # top-level combinators on tool parameter schemas.  LCM context-engine
+    # tools are appended after ``sanitize_tool_schemas`` at tool-load time.
+    for key in ("allOf", "anyOf", "oneOf", "enum", "not"):
+        repaired.pop(key, None)
 
     # Top-level must be an object schema
     if repaired.get("type") != "object":

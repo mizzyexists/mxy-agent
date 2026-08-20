@@ -859,7 +859,7 @@ def _shared_submit_properties() -> dict:
             "description": 'Output aspect ratio. "auto" lets the model choose.',
         },
         "duration": {
-            "oneOf": [
+            "anyOf": [
                 {"type": "integer", "minimum": 5, "maximum": 20},
                 {"type": "string", "const": "auto"},
             ],

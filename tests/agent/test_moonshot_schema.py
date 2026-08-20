@@ -138,6 +138,25 @@ class TestAnyOfParentType:
         assert "anyOf" in mode
         assert "type" not in mode  # parent type stripped
 
+    def test_oneof_multiple_non_null_preserved(self):
+        """oneOf [integer, string] (no null) → kept as-is with no inferred parent type."""
+        params = {
+            "type": "object",
+            "properties": {
+                "duration": {
+                    "oneOf": [
+                        {"type": "integer", "minimum": 5, "maximum": 20},
+                        {"type": "string", "const": "auto"},
+                    ],
+                    "default": "auto",
+                },
+            },
+        }
+        out = sanitize_moonshot_tool_parameters(params)
+        duration = out["properties"]["duration"]
+        assert "oneOf" in duration
+        assert "type" not in duration
+
     def test_anyof_enum_with_null_collapsed(self):
         """anyOf [{enum: [...], type: string}, {type: null}] → enum + type only."""
         params = {
@@ -160,6 +179,16 @@ class TestAnyOfParentType:
 
 class TestTopLevelGuarantees:
     """The returned top-level schema is always a well-formed object."""
+
+    def test_top_level_allof_is_stripped(self):
+        params = {
+            "type": "object",
+            "properties": {"mode": {"type": "string"}},
+            "allOf": [{"if": {"properties": {"mode": {"const": "x"}}}, "then": {"required": ["mode"]}}],
+        }
+        out = sanitize_moonshot_tool_parameters(params)
+        assert out["type"] == "object"
+        assert "allOf" not in out
 
     def test_non_dict_input_returns_empty_object(self):
         empty = {"type": "object", "properties": {}, "required": []}
