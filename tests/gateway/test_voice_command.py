@@ -1490,6 +1490,65 @@ class TestVoiceChannelAwareness:
         assert "1 participant" in ctx
         assert "Alice" in ctx
 
+    def test_should_suppress_text_for_synthetic_vc_turn(self):
+        from gateway.config import Platform
+
+        adapter = self._make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        adapter._voice_clients[111] = vc
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="123",
+            user_id="42",
+            chat_type="channel",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.VOICE,
+            source=source,
+            raw_message=SimpleNamespace(guild_id=111),
+        )
+        assert adapter.should_suppress_text_delivery(event) is True
+
+    def test_should_not_suppress_text_for_typed_messages(self):
+        from gateway.config import Platform
+
+        adapter = self._make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        adapter._voice_clients[111] = vc
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="123",
+            user_id="42",
+            chat_type="channel",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=SimpleNamespace(guild_id=111),
+        )
+        assert adapter.should_suppress_text_delivery(event) is False
+
+
+    def test_drain_stream_pcm_tracks_incremental_bytes(self):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+
+        adapter = self._make_adapter()
+        receiver = VoiceReceiver(MagicMock(), allowed_user_ids={1001})
+        receiver._running = True
+        receiver.map_ssrc(42, 1001)
+        pcm = b"\x01\x02" * 4800  # 0.1s stereo @ 48kHz
+        receiver._buffers[42] = bytearray(pcm)
+        chunks = receiver.drain_stream_pcm()
+        assert len(chunks) == 1
+        assert chunks[0][0] == 1001
+        assert chunks[0][1] == 42
+        assert len(chunks[0][2]) == len(pcm)
+        assert receiver.drain_stream_pcm() == []
+
 
 # ---------------------------------------------------------------------------
 # Bugfix: disconnect() must clean up voice state

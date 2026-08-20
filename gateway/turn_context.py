@@ -102,6 +102,9 @@ class TurnContext:
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False
+    # When True, skip streaming/interim text delivery to chat (e.g. Discord VC
+    # replies are spoken in the voice channel only).
+    suppress_text_delivery: bool = False
 
     # --- lazy-imported callables captured from the outer body -------------
     AIAgent: Any = None

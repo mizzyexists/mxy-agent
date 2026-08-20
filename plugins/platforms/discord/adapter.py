@@ -149,11 +149,13 @@ from gateway.platforms.helpers import (
 )
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
+    AudioFormat,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
     SendResult,
+    StreamingTTSHandle,
     cache_image_from_url,
     cache_image_from_bytes,
     cache_audio_from_url,
@@ -593,6 +595,7 @@ class VoiceReceiver:
         # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: Dict[int, float] = {}
+        self._stream_read_pos: Dict[int, int] = defaultdict(int)
 
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: Dict[int, object] = {}
@@ -631,6 +634,7 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._stream_read_pos.clear()
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
@@ -887,6 +891,51 @@ class VoiceReceiver:
 
         return completed
 
+    def drain_stream_pcm(self) -> list:
+        """Return ``(user_id, ssrc, pcm_bytes)`` chunks not yet fed to streaming STT."""
+        chunks = []
+        with self._lock:
+            ssrc_user_map = dict(self._ssrc_to_user)
+            for ssrc, buf in self._buffers.items():
+                pos = self._stream_read_pos.get(ssrc, 0)
+                if len(buf) <= pos:
+                    continue
+                user_id = ssrc_user_map.get(ssrc, 0)
+                if not user_id:
+                    user_id = self._infer_user_for_ssrc(ssrc)
+                if not user_id:
+                    continue
+                chunks.append((user_id, ssrc, bytes(buf[pos:])))
+                self._stream_read_pos[ssrc] = len(buf)
+        return chunks
+
+    def get_silent_speakers(self, threshold: float) -> list:
+        """Return ``(user_id, ssrc)`` pairs whose utterance should be finalized."""
+        now = time.monotonic()
+        pending = []
+        with self._lock:
+            ssrc_user_map = dict(self._ssrc_to_user)
+            for ssrc, buf in self._buffers.items():
+                if not buf:
+                    continue
+                last_time = self._last_packet_time.get(ssrc, now)
+                silence_duration = now - last_time
+                buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
+                if silence_duration < threshold or buf_duration < self.MIN_SPEECH_DURATION:
+                    continue
+                user_id = ssrc_user_map.get(ssrc, 0)
+                if not user_id:
+                    user_id = self._infer_user_for_ssrc(ssrc)
+                if user_id:
+                    pending.append((user_id, ssrc))
+        return pending
+
+    def clear_ssrc(self, ssrc: int) -> None:
+        with self._lock:
+            self._buffers.pop(ssrc, None)
+            self._last_packet_time.pop(ssrc, None)
+            self._stream_read_pos.pop(ssrc, None)
+
     def flush_pending(self) -> list:
         """Return buffered utterances that have not yet reached silence."""
         completed = []
@@ -1093,7 +1142,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
+        self._streaming_stt_managers: Dict[int, Any] = {}  # guild_id -> CartesiaGuildSTTManager
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
+        self._voice_input_partial_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
         # linked text-channel id; set by run.py. Lets the inactivity timer leave
@@ -4544,6 +4595,90 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    def _guild_id_for_text_channel(self, chat_id: str) -> Optional[int]:
+        for gid, text_ch_id in self._voice_text_channels.items():
+            if str(text_ch_id) == str(chat_id):
+                return int(gid)
+        return None
+
+    def supports_streaming_tts(self, chat_id: str, audio_format: AudioFormat) -> bool:
+        guild_id = self._guild_id_for_text_channel(chat_id)
+        if guild_id is None or not self.is_in_voice_channel(guild_id):
+            return False
+        return self.voice_mixer_active(guild_id)
+
+    async def begin_streaming_tts(
+        self,
+        chat_id: str,
+        audio_format: AudioFormat,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[StreamingTTSHandle]:
+        guild_id = self._guild_id_for_text_channel(chat_id)
+        if guild_id is None:
+            return None
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id)
+        if mixer is None:
+            return None
+
+        self._cancel_voice_timeout(guild_id)
+        speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
+        child = mixer.start_streaming_speech(
+            gain=speech_gain,
+            lead_silence=self._lead_silence_bytes(),
+        )
+        handle = StreamingTTSHandle(
+            chat_id=str(chat_id),
+            audio_format=audio_format,
+        )
+        handle.speech_child = child  # type: ignore[attr-defined]
+        handle.guild_id = guild_id  # type: ignore[attr-defined]
+        self._reset_voice_timeout(guild_id)
+        return handle
+
+    async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> None:
+        if handle is None or handle.aborted or not chunk:
+            return
+        child = getattr(handle, "speech_child", None)
+        guild_id = getattr(handle, "guild_id", None)
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if guild_id is not None else None
+        if child is None or mixer is None:
+            return
+        try:
+            from voice_mixer import convert_tts_pcm_to_discord
+        except ImportError:
+            from .voice_mixer import convert_tts_pcm_to_discord
+
+        pcm = await asyncio.to_thread(
+            convert_tts_pcm_to_discord,
+            chunk,
+            sample_rate=int(handle.audio_format.sample_rate),
+            channels=int(handle.audio_format.channels),
+        )
+        mixer.append_streaming_speech(child, pcm)
+        if pcm and not handle.audible:
+            handle.audible = True
+
+    async def finish_streaming_tts(self, handle: StreamingTTSHandle, *, interrupted: bool = False) -> None:
+        if handle is None:
+            return
+        child = getattr(handle, "speech_child", None)
+        guild_id = getattr(handle, "guild_id", None)
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if guild_id is not None else None
+        if interrupted and mixer is not None:
+            mixer.stop_speech()
+            return
+        if child is not None and mixer is not None:
+            mixer.finish_streaming_speech(child)
+
+    async def abort_streaming_tts(self, handle: StreamingTTSHandle, error: Optional[str] = None) -> None:
+        if handle is None:
+            return
+        handle.aborted = True
+        guild_id = getattr(handle, "guild_id", None)
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if guild_id is not None else None
+        if mixer is not None:
+            mixer.stop_speech()
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.
 
@@ -4607,17 +4742,25 @@ class DiscordAdapter(BasePlatformAdapter):
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
-            if receiver:
+            stt_manager = self._streaming_stt_managers.pop(guild_id, None)
+            if stt_manager is not None:
+                if receiver:
+                    for user_id, _ssrc in receiver.get_silent_speakers(0.0):
+                        await stt_manager.finalize_user(user_id)
+                await stt_manager.close()
+            elif receiver:
                 pending_inputs = receiver.flush_pending()
+            if receiver:
                 receiver.stop()
             listen_task = self._voice_listen_tasks.pop(guild_id, None)
             if listen_task:
                 listen_task.cancel()
 
             guild = self._client.get_guild(guild_id) if self._client is not None else None
-            for user_id, pcm_data in pending_inputs:
-                if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
-                    await self._process_voice_input(guild_id, user_id, pcm_data)
+            if stt_manager is None:
+                for user_id, pcm_data in pending_inputs:
+                    if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
+                        await self._process_voice_input(guild_id, user_id, pcm_data)
 
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
@@ -4805,6 +4948,23 @@ class DiscordAdapter(BasePlatformAdapter):
         vc = self._voice_clients.get(guild_id)
         return vc is not None and vc.is_connected()
 
+    def should_suppress_text_delivery(self, event: "MessageEvent") -> bool:
+        """Skip posting agent replies to the linked text channel during VC.
+
+        Synthetic voice-channel turns (``_handle_voice_channel_input``) carry
+        ``MessageType.VOICE`` and a ``raw_message.guild_id`` while the bot is
+        connected.  Spoken replies still go out via ``play_tts`` / streaming TTS.
+        """
+        if event.message_type != MessageType.VOICE:
+            return False
+        guild_id = getattr(getattr(event, "raw_message", None), "guild_id", None)
+        if guild_id is None:
+            return False
+        try:
+            return self.is_in_voice_channel(int(guild_id))
+        except (TypeError, ValueError):
+            return False
+
     def get_voice_channel_info(self, guild_id: int) -> Optional[Dict[str, Any]]:
         """Return voice channel awareness info for the given guild.
 
@@ -4881,12 +5041,136 @@ class DiscordAdapter(BasePlatformAdapter):
     # the UDP route after ~60s of silence.
     _KEEPALIVE_INTERVAL = 15
 
+    def _streaming_stt_enabled(self) -> bool:
+        try:
+            from agent.transcription_registry import get_provider
+            from hermes_cli.plugins import _ensure_plugins_discovered
+            from tools.transcription_tools import _load_stt_config
+
+            cfg = _load_stt_config() or {}
+            if str(cfg.get("provider") or "").strip().lower() != "cartesia":
+                return False
+            section = cfg.get("cartesia")
+            if isinstance(section, dict) and section.get("streaming") is False:
+                return False
+            _ensure_plugins_discovered()
+            provider = get_provider("cartesia")
+            return provider is not None and hasattr(provider, "create_guild_streaming_manager")
+        except Exception:
+            return False
+
+    def _streaming_stt_finalize_silence(self) -> float:
+        try:
+            from tools.transcription_tools import _load_stt_config
+
+            cfg = _load_stt_config() or {}
+            section = cfg.get("cartesia")
+            if isinstance(section, dict):
+                return float(section.get("finalize_silence_secs", 0.6) or 0.6)
+        except Exception:
+            pass
+        return 0.6
+
+    def _voice_speculative_enabled(self) -> bool:
+        try:
+            from tools.transcription_tools import _load_stt_config
+
+            stt_cfg = _load_stt_config() or {}
+            if str(stt_cfg.get("provider") or "").strip().lower() != "cartesia":
+                return False
+            section = stt_cfg.get("cartesia")
+            if isinstance(section, dict):
+                if section.get("streaming") is False:
+                    return False
+                return bool(section.get("speculative", True))
+        except Exception:
+            pass
+        return False
+
+    async def _get_streaming_stt_manager(self, guild_id: int):
+        manager = self._streaming_stt_managers.get(guild_id)
+        if manager is not None:
+            return manager
+        if not self._streaming_stt_enabled():
+            return None
+        from agent.transcription_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        provider = get_provider("cartesia")
+        if provider is None or not hasattr(provider, "create_guild_streaming_manager"):
+            return None
+
+        async def _on_transcript(user_id: int, transcript: str) -> None:
+            await self._on_streaming_stt_transcript(guild_id, user_id, transcript)
+
+        async def _on_partial(user_id: int, partial: str) -> None:
+            await self._on_streaming_stt_partial(guild_id, user_id, partial)
+
+        on_partial = _on_partial if self._voice_speculative_enabled() else None
+        manager = provider.create_guild_streaming_manager(_on_transcript, on_partial)
+        if manager is None:
+            return None
+        self._streaming_stt_managers[guild_id] = manager
+        return manager
+
+    async def _on_streaming_stt_transcript(
+        self, guild_id: int, user_id: int, transcript: str
+    ) -> None:
+        from tools.voice_mode import is_whisper_hallucination
+
+        cleaned = (transcript or "").strip()
+        if not cleaned or is_whisper_hallucination(cleaned):
+            return
+
+        receiver = self._voice_receivers.get(guild_id)
+        manager = self._streaming_stt_managers.get(guild_id)
+        if receiver and manager:
+            ssrc = manager.ssrc_for_user(user_id)
+            if ssrc is not None:
+                receiver.clear_ssrc(ssrc)
+
+        logger.info("Streaming voice input from user %d: %s", user_id, cleaned[:100])
+        if self._voice_input_callback:
+            await self._voice_input_callback(
+                guild_id=guild_id,
+                user_id=user_id,
+                transcript=cleaned,
+            )
+
+    async def _on_streaming_stt_partial(
+        self, guild_id: int, user_id: int, partial: str
+    ) -> None:
+        partial = (partial or "").strip()
+        if not partial or not self._voice_input_partial_callback:
+            return
+        logger.debug(
+            "Streaming voice partial from user %d: %s",
+            user_id,
+            partial[:100],
+        )
+        await self._voice_input_partial_callback(
+            guild_id=guild_id,
+            user_id=user_id,
+            partial=partial,
+        )
+
+    async def _close_streaming_stt_manager(self, guild_id: int) -> None:
+        manager = self._streaming_stt_managers.pop(guild_id, None)
+        if manager is not None:
+            await manager.close()
+
     async def _voice_listen_loop(self, guild_id: int):
         """Periodically check for completed utterances and process them."""
         receiver = self._voice_receivers.get(guild_id)
         if not receiver:
             return
         last_keepalive = time.monotonic()
+        streaming = self._streaming_stt_enabled()
+        stt_manager = await self._get_streaming_stt_manager(guild_id) if streaming else None
+        if streaming and stt_manager is None:
+            streaming = False
+        finalize_threshold = self._streaming_stt_finalize_silence() if streaming else None
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
@@ -4903,11 +5187,33 @@ class DiscordAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
-                completed = receiver.check_silence()
                 # Voice inputs always originate from a specific guild
                 # (guild_id is in scope). Pass it so role checks are
                 # guild-scoped and not cross-guild.
                 _vc_guild = self._client.get_guild(guild_id) if self._client is not None else None
+
+                if stt_manager and finalize_threshold is not None:
+                    for user_id, ssrc, pcm_data in receiver.drain_stream_pcm():
+                        if not self._is_allowed_user(
+                            str(user_id),
+                            guild=_vc_guild,
+                            is_dm=False,
+                        ):
+                            continue
+                        self._reset_voice_timeout(guild_id)
+                        await stt_manager.feed(user_id, ssrc, pcm_data)
+
+                    for user_id, _ssrc in receiver.get_silent_speakers(finalize_threshold):
+                        if not self._is_allowed_user(
+                            str(user_id),
+                            guild=_vc_guild,
+                            is_dm=False,
+                        ):
+                            continue
+                        await stt_manager.finalize_user(user_id)
+                    continue
+
+                completed = receiver.check_silence()
                 for user_id, pcm_data in completed:
                     if not self._is_allowed_user(
                         str(user_id),

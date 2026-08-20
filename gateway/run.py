@@ -5357,9 +5357,11 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if ctx.suppress_text_delivery:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
-        _want_interim_consumer = _want_interim_messages
+        _want_interim_consumer = _want_interim_messages and not ctx.suppress_text_delivery
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -7144,6 +7146,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
         self._recent_voice_transcripts: Dict[tuple[int, int], List[tuple[float, str]]] = {}
+        # Speculative voice (Phase 4): early LLM on partial STT, audio held until final.
+        self._voice_utterances: Dict[tuple[int, int], Any] = {}
+        self._voice_defer_audio_sessions: set = set()
+        self._voice_held_replies: Dict[str, tuple] = {}
+        self._voice_partial_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
@@ -12858,6 +12865,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # transcription is forwarded without requiring /voice join.
                 if hasattr(adapter, "_voice_input_callback"):
                     adapter._voice_input_callback = self._handle_voice_channel_input
+                if hasattr(adapter, "_voice_input_partial_callback"):
+                    adapter._voice_input_partial_callback = self._handle_voice_partial_transcript
                 connected_count += 1
                 self._update_platform_runtime_status(
                     platform.value, platform_state="connected", error_code=None, error_message=None,
@@ -14221,6 +14230,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
+                        if hasattr(adapter, "_voice_input_partial_callback"):
+                            adapter._voice_input_partial_callback = self._handle_voice_partial_transcript
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -20044,6 +20055,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            _suppress_text_delivery = False
+            _delivery_adapter = self._adapter_for_source(source)
+            _suppress_fn = getattr(_delivery_adapter, "should_suppress_text_delivery", None)
+            if callable(_suppress_fn):
+                _suppress_text_delivery = bool(_suppress_fn(event))
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -20059,6 +20075,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                suppress_text_delivery=_suppress_text_delivery,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -20633,10 +20650,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
             if (
-                not _streaming_tts_done
+                not self.voice_defer_audio_for_session(session_key)
+                and not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
                 await self._send_voice_reply(event, response)
+            elif (
+                self.voice_defer_audio_for_session(session_key)
+                and (event.metadata or {}).get("voice_speculative_partial")
+                and response
+                and not response.startswith("Error:")
+                and not _streaming_tts_done
+            ):
+                # Hold until finalize delivers via _deliver_held_voice_reply.
+                # Do not gate on _should_send_voice_reply: that helper skips
+                # voice input because base auto-TTS normally handles it.
+                self._voice_held_replies[session_key] = (response, event)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -20660,7 +20689,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
                 # still surface the runtime metadata on the final reply.
-                if _footer_line:
+                if _footer_line and not _suppress_text_delivery:
                     try:
                         _foot_adapter = self._adapter_for_source(source)
                         if _foot_adapter:
@@ -21702,6 +21731,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_voice_input_partial_callback"):
+            adapter._voice_input_partial_callback = self._handle_voice_partial_transcript
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
         # Let the adapter's inactivity timer see the live voice-reply mode so it
@@ -21735,8 +21766,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
             )
-        # Join failed — clear callback
+        # Join failed — clear callbacks
         adapter._voice_input_callback = None
+        if hasattr(adapter, "_voice_input_partial_callback"):
+            adapter._voice_input_partial_callback = None
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
@@ -21813,24 +21846,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recent_store[key] = recent[-5:]
         return False
 
-    async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
-    ):
-        """Handle transcribed voice from a user in a voice channel.
+    def _voice_speaker_key(self, guild_id: int, user_id: int) -> tuple[int, int]:
+        return (int(guild_id), int(user_id))
 
-        Creates a synthetic MessageEvent and processes it through the
-        adapter's full message pipeline (session, typing, agent, TTS reply).
-        """
+    def _voice_speculative_config(self) -> Dict[str, Any]:
+        from gateway.voice_speculative import load_voice_speculative_config
+        from tools.transcription_tools import _load_stt_config
+
+        return load_voice_speculative_config(_load_stt_config())
+
+    def _voice_speculative_enabled(self) -> bool:
+        try:
+            cfg = self._voice_speculative_config()
+            if not cfg.get("enabled", True):
+                return False
+            from tools.transcription_tools import _load_stt_config
+
+            stt_cfg = _load_stt_config() or {}
+            if str(stt_cfg.get("provider") or "").strip().lower() != "cartesia":
+                return False
+            cartesia = stt_cfg.get("cartesia")
+            if isinstance(cartesia, dict) and cartesia.get("streaming") is False:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def voice_defer_audio_for_session(self, session_key: str) -> bool:
+        return str(session_key or "") in self._voice_defer_audio_sessions
+
+    def _build_voice_channel_event(
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        *,
+        speculative_partial: bool = False,
+    ) -> Optional[MessageEvent]:
         adapter = self.adapters.get(Platform.DISCORD)
         if not adapter:
-            return
+            return None
 
         text_ch_id = adapter._voice_text_channels.get(guild_id)
         if not text_ch_id:
-            return
+            return None
 
-        # Build source — reuse the linked text channel's metadata when available
-        # so voice input shares the same session as the bound text conversation.
         source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
         if source_data:
             source = SessionSource.from_dict(source_data)
@@ -21845,11 +21905,184 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_type="channel",
             )
 
-        # Check authorization before processing voice input
         if not self._is_user_authorized(source):
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
+            return None
+
+        from types import SimpleNamespace
+
+        channel_prompt: Optional[str] = None
+        resolver = getattr(adapter, "_resolve_channel_prompt", None)
+        if callable(resolver):
+            try:
+                resolved = resolver(str(text_ch_id))
+                channel_prompt = resolved if isinstance(resolved, str) else None
+            except Exception:
+                channel_prompt = None
+
+        metadata: Dict[str, Any] = {}
+        if speculative_partial:
+            metadata["voice_speculative_partial"] = True
+            metadata["voice_defer_audio"] = True
+
+        return MessageEvent(
+            source=source,
+            text=transcript,
+            message_type=MessageType.VOICE,
+            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+            channel_prompt=channel_prompt,
+            metadata=metadata,
+        )
+
+    async def _handle_voice_partial_transcript(
+        self, guild_id: int, user_id: int, partial: str
+    ) -> None:
+        if not self._voice_speculative_enabled():
+            return
+        partial = (partial or "").strip()
+        if not partial:
             return
 
+        from gateway.voice_speculative import VoiceUtteranceState, should_start_speculative
+
+        key = self._voice_speaker_key(guild_id, user_id)
+        state = self._voice_utterances.get(key)
+        if state is None:
+            state = VoiceUtteranceState()
+            self._voice_utterances[key] = state
+        state.latest_partial = partial
+        if state.speculative_started:
+            return
+
+        cfg = self._voice_speculative_config()
+        if not should_start_speculative(partial, cfg):
+            return
+
+        old_task = self._voice_partial_tasks.pop(key, None)
+        if old_task is not None:
+            old_task.cancel()
+
+        stable_ms = max(50, int(cfg.get("stable_ms", 350))) / 1000.0
+
+        async def _debounced_start() -> None:
+            try:
+                await asyncio.sleep(stable_ms)
+                await self._maybe_start_speculative_voice_turn(guild_id, user_id)
+            except asyncio.CancelledError:
+                pass
+
+        self._voice_partial_tasks[key] = asyncio.create_task(_debounced_start())
+
+    async def _maybe_start_speculative_voice_turn(
+        self, guild_id: int, user_id: int
+    ) -> None:
+        from gateway.voice_speculative import should_start_speculative
+
+        key = self._voice_speaker_key(guild_id, user_id)
+        state = self._voice_utterances.get(key)
+        if state is None or state.speculative_started:
+            return
+
+        partial = (state.latest_partial or "").strip()
+        cfg = self._voice_speculative_config()
+        if not should_start_speculative(partial, cfg):
+            return
+
+        event = self._build_voice_channel_event(
+            guild_id, user_id, partial, speculative_partial=True
+        )
+        if event is None:
+            return
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            return
+
+        session_key = self._session_key_for_source(event.source)
+        state.speculative_started = True
+        state.started_text = partial
+        state.session_key = session_key
+        self._voice_defer_audio_sessions.add(session_key)
+
+        await self._flush_pending_voice_reply(session_key)
+
+        logger.info(
+            "Speculative voice turn guild=%s user=%s: %s",
+            guild_id,
+            user_id,
+            partial[:100],
+        )
+        await adapter.handle_message(event)
+
+    async def _deliver_held_voice_reply(self, session_key: str) -> None:
+        held = self._voice_held_replies.pop(session_key, None)
+        if not held:
+            return
+        response, event = held
+        if response and event is not None:
+            logger.info(
+                "Delivering held speculative voice reply for session %s (%d chars)",
+                session_key,
+                len(response),
+            )
+            await self._send_voice_reply(event, response)
+
+    async def _flush_pending_voice_reply(self, session_key: str) -> None:
+        """Play any held speculative reply before starting a new voice turn."""
+        if session_key and session_key in self._voice_held_replies:
+            await self._deliver_held_voice_reply(session_key)
+
+    async def _finalize_speculative_voice_turn(
+        self,
+        guild_id: int,
+        user_id: int,
+        final_text: str,
+        state: Any,
+    ) -> None:
+        from gateway.voice_speculative import voice_texts_compatible
+
+        final_text = (final_text or "").strip()
+        session_key = str(state.session_key or "")
+        cfg = self._voice_speculative_config()
+        ratio = float(cfg.get("compatible_ratio", 0.72))
+
+        running_agent = self._running_agents.get(session_key)
+        if running_agent is _AGENT_PENDING_SENTINEL:
+            running_agent = None
+
+        self._voice_defer_audio_sessions.discard(session_key)
+
+        if voice_texts_compatible(state.started_text, final_text, ratio=ratio):
+            if running_agent is not None and hasattr(running_agent, "redirect"):
+                from gateway.voice_speculative import normalize_voice_text
+
+                if normalize_voice_text(final_text) != normalize_voice_text(
+                    state.started_text
+                ):
+                    try:
+                        running_agent.redirect(final_text)
+                    except Exception as exc:
+                        logger.debug("Voice redirect failed: %s", exc)
+            # Deliver held audio whenever a reply was produced, even if the
+            # running-agent slot has not been released yet — finalize can run
+            # while the speculative handler is still unwinding in base.py.
+            await self._deliver_held_voice_reply(session_key)
+            return
+
+        self._voice_held_replies.pop(session_key, None)
+        if running_agent is not None:
+            try:
+                request_hard_interrupt(running_agent, "voice transcript correction")
+            except Exception as exc:
+                logger.debug("Voice speculative interrupt failed: %s", exc)
+        await self._dispatch_voice_channel_turn(guild_id, user_id, final_text)
+
+    async def _dispatch_voice_channel_turn(
+        self, guild_id: int, user_id: int, transcript: str
+    ) -> None:
+        transcript = (transcript or "").strip()
+        if not transcript:
+            return
         if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
             logger.info(
                 "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
@@ -21859,38 +22092,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
-        # Show transcript in text channel (after auth, with mention sanitization)
-        try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
+        event = self._build_voice_channel_event(guild_id, user_id, transcript)
+        if event is None:
+            return
 
-        # Build a synthetic MessageEvent and feed through the normal pipeline
-        # Use SimpleNamespace as raw_message so _get_guild_id() can extract
-        # guild_id and _send_voice_reply() plays audio in the voice channel.
-        from types import SimpleNamespace
-        # Resolve the bound text channel's channel_prompt so voice input gets
-        # the same per-channel context as typed messages (#50149).
-        channel_prompt: Optional[str] = None
-        resolver = getattr(adapter, "_resolve_channel_prompt", None)
-        if callable(resolver):
-            try:
-                resolved = resolver(str(text_ch_id))
-                channel_prompt = resolved if isinstance(resolved, str) else None
-            except Exception:
-                channel_prompt = None
-        event = MessageEvent(
-            source=source,
-            text=transcript,
-            message_type=MessageType.VOICE,
-            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
-            channel_prompt=channel_prompt,
-        )
+        session_key = self._session_key_for_source(event.source)
+        await self._flush_pending_voice_reply(session_key)
 
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            return
+
+        logger.info("Voice input from user %d: %s", user_id, transcript[:100])
         await adapter.handle_message(event)
+
+    async def _handle_voice_channel_input(
+        self, guild_id: int, user_id: int, transcript: str
+    ):
+        """Handle transcribed voice from a user in a voice channel."""
+        key = self._voice_speaker_key(guild_id, user_id)
+        partial_task = self._voice_partial_tasks.pop(key, None)
+        if partial_task is not None:
+            partial_task.cancel()
+
+        state = self._voice_utterances.pop(key, None)
+        if state is not None and state.speculative_started:
+            await self._finalize_speculative_voice_turn(
+                guild_id, user_id, transcript, state
+            )
+            return
+
+        await self._dispatch_voice_channel_turn(guild_id, user_id, transcript)
 
     def _should_send_voice_reply(
         self,
@@ -27769,6 +28001,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        suppress_text_delivery: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -27789,6 +28022,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                suppress_text_delivery=suppress_text_delivery,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -27802,6 +28036,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                suppress_text_delivery=suppress_text_delivery,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -27945,6 +28180,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        suppress_text_delivery: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28254,6 +28490,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            suppress_text_delivery=suppress_text_delivery,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -28511,6 +28748,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _stts_adapter is not None
             and _is_voice_input
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
+            and not self.voice_defer_audio_for_session(session_key or "")
         ):
             try:
                 from gateway.streaming_tts_consumer import StreamingTTSConsumer

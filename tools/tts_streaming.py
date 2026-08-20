@@ -486,3 +486,53 @@ class XAIStreamer(StreamingTTSProvider):
                     return
                 logger.warning("xAI WS receive failed: %s", exc)
                 return
+
+
+@register("cartesia")
+class CartesiaStreamer(StreamingTTSProvider):
+    """Cartesia Sonic /tts/bytes → raw pcm_s16le chunks."""
+
+    sample_rate = 24000
+
+    @staticmethod
+    def available() -> bool:
+        return bool(_resolve_key("CARTESIA_API_KEY", "cartesia"))
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        import requests
+
+        section = self.section or {}
+        model_id = str(section.get("model") or "sonic-3.5")
+        voice_id = str(section.get("voice_id") or "a0e99841-438c-4a64-b679-ae501e7d6091")
+        sample_rate = int(section.get("sample_rate") or self.sample_rate)
+        language = str(section.get("language") or "en")
+        api_key = _resolve_key("CARTESIA_API_KEY", "cartesia")
+        if not api_key:
+            raise RuntimeError("CARTESIA_API_KEY is not set")
+
+        body = {
+            "model_id": model_id,
+            "transcript": text,
+            "voice": {"mode": "id", "id": voice_id},
+            "output_format": {
+                "container": "raw",
+                "encoding": "pcm_s16le",
+                "sample_rate": sample_rate,
+            },
+            "language": language,
+        }
+        response = requests.post(
+            "https://api.cartesia.ai/tts/bytes",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Cartesia-Version": "2026-08-14",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=int(section.get("timeout", 120) or 120),
+            stream=True,
+        )
+        if response.status_code >= 400:
+            detail = response.text.strip()[:500]
+            raise RuntimeError(f"Cartesia TTS HTTP {response.status_code}: {detail}")
+        yield from _capped(response.iter_content(chunk_size=4096), "Cartesia streaming TTS")

@@ -6465,7 +6465,19 @@ class BasePlatformAdapter(ABC):
                 _tts_path = None
                 _tts_paths: List[str] = []
                 _tts_requested_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
+                # Speculative voice turns stamp voice_defer_audio on the event
+                # metadata for the whole agent run, but finalize clears the
+                # runner's session defer set as soon as the final transcript
+                # arrives — often before Kimi finishes.  Trust the session set
+                # only; stale metadata must not suppress TTS after finalize.
+                _defer_voice_audio = False
+                _runner = getattr(self, "gateway_runner", None)
+                if _runner is not None and session_key:
+                    _defer_voice_audio = _runner.voice_defer_audio_for_session(
+                        session_key
+                    )
+                if (not _defer_voice_audio
+                        and self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
@@ -6558,7 +6570,17 @@ class BasePlatformAdapter(ABC):
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
-                if text_content and not _tts_caption_delivered:
+                _suppress_text_fn = getattr(self, "should_suppress_text_delivery", None)
+                _suppress_text = (
+                    callable(_suppress_text_fn) and _suppress_text_fn(event)
+                )
+                if _suppress_text and text_content:
+                    logger.info(
+                        "[%s] Suppressing text delivery for voice-channel turn in %s",
+                        self.name,
+                        event.source.chat_id,
+                    )
+                if text_content and not _tts_caption_delivered and not _suppress_text:
                     delivery_adapter = self._final_delivery_adapter(event.source)
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
@@ -6795,12 +6817,18 @@ class BasePlatformAdapter(ABC):
                     or images or local_files or media_files
                 )
                 if not _anything_delivered and _response_pre_extract.strip():
-                    logger.error(
-                        "[%s] response_delivery_dropped: non-empty response "
-                        "(%d chars) produced no delivered message or attachment "
-                        "for %s (empty after extract, recovery yielded nothing).",
-                        self.name, len(_response_pre_extract), event.source.chat_id,
+                    _held_for_voice = (
+                        _runner is not None
+                        and session_key
+                        and _runner.voice_defer_audio_for_session(session_key)
                     )
+                    if not _held_for_voice:
+                        logger.error(
+                            "[%s] response_delivery_dropped: non-empty response "
+                            "(%d chars) produced no delivered message or attachment "
+                            "for %s (empty after extract, recovery yielded nothing).",
+                            self.name, len(_response_pre_extract), event.source.chat_id,
+                        )
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)

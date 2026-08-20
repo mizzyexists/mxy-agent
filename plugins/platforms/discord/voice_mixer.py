@@ -153,6 +153,84 @@ class MixerChild:
         return samples
 
 
+class StreamingSpeechChild(MixerChild):
+    """Speech child fed incrementally for streaming TTS."""
+
+    __slots__ = ("_buffer", "_lock", "_append_pos")
+
+    def __init__(
+        self,
+        *,
+        lead_silence: bytes = b"",
+        gain: float = 1.0,
+        fade_in_ms: int = 40,
+    ):
+        initial = lead_silence or b""
+        super().__init__(
+            "streaming-speech",
+            initial,
+            loop=False,
+            gain=gain,
+            is_speech=True,
+            fade_in_ms=fade_in_ms,
+        )
+        self._buffer = bytearray(initial)
+        self._lock = threading.Lock()
+        self._append_pos = len(initial)
+        self._streaming_finished = False
+
+    def append(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        with self._lock:
+            self._buffer.extend(pcm)
+            self._pcm = bytes(self._buffer)
+
+    def finish(self) -> None:
+        with self._lock:
+            self._streaming_finished = True
+            remainder = len(self._buffer) % FRAME_SIZE
+            if remainder:
+                pad = b"\x00" * (FRAME_SIZE - remainder)
+                self._buffer.extend(pad)
+                self._pcm = bytes(self._buffer)
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        if self._finished:
+            return None
+        if self._pos >= len(self._pcm):
+            if self._streaming_finished:
+                self._finished = True
+                return None
+            np = _require_numpy()
+            return np.zeros(FRAME_SIZE // 2, dtype=np.float32)
+        return super().read_frame()
+
+
+def convert_tts_pcm_to_discord(
+    chunk: bytes,
+    *,
+    sample_rate: int = 24000,
+    channels: int = 1,
+) -> bytes:
+    """Convert provider mono PCM to Discord-native 48 kHz stereo s16le."""
+    if not chunk:
+        return b""
+    np = _require_numpy()
+    samples = np.frombuffer(chunk, dtype=np.int16)
+    if channels != 1:
+        samples = samples.reshape(-1, channels)[:, 0]
+    if sample_rate == SAMPLE_RATE // 2:
+        samples = np.repeat(samples, 2)
+    elif sample_rate != SAMPLE_RATE:
+        target_len = max(1, int(round(len(samples) * SAMPLE_RATE / sample_rate)))
+        x_old = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
+        x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+        samples = np.interp(x_new, x_old, samples.astype(np.float64)).astype(np.int16)
+    stereo = np.repeat(samples[:, None], CHANNELS, axis=1).reshape(-1)
+    return stereo.astype(np.int16).tobytes()
+
+
 class VoiceMixer(discord.AudioSource):
     """A continuous ``discord.AudioSource`` that mixes N child streams.
 
@@ -240,6 +318,37 @@ class VoiceMixer(discord.AudioSource):
         with self._lock:
             self._speech.clear()
             self._begin_duck_release_locked()
+
+    def start_streaming_speech(
+        self,
+        *,
+        gain: Optional[float] = None,
+        fade_in_ms: int = 40,
+        lead_silence: bytes = b"",
+    ) -> "StreamingSpeechChild":
+        """Begin a streaming speech clip that accepts incremental PCM."""
+        with self._lock:
+            child = StreamingSpeechChild(
+                lead_silence=lead_silence,
+                gain=self._speech_gain if gain is None else float(gain),
+                fade_in_ms=fade_in_ms,
+            )
+            self._speech.append(child)
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+            return child
+
+    def append_streaming_speech(self, child: "StreamingSpeechChild", pcm: bytes) -> None:
+        if child is None or not pcm:
+            return
+        child.append(pcm)
+
+    def finish_streaming_speech(self, child: "StreamingSpeechChild") -> None:
+        if child is None:
+            return
+        child.finish()
 
     def _begin_duck_release_locked(self) -> None:
         self._speech_active = False
