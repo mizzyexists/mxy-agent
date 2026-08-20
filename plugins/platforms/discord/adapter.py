@@ -1155,6 +1155,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Installed once per guild on join; lets acks / TTS / the "thinking"
         # loop overlap in one outgoing stream instead of stop-and-swap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
+        self._voice_output_locks: Dict[int, asyncio.Lock] = {}  # serialize VC TTS
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Track threads where the bot has participated so follow-up messages
@@ -4595,6 +4596,43 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    def _voice_output_lock(self, guild_id: int) -> asyncio.Lock:
+        """Return the per-guild lock that serializes outbound VC speech."""
+        lock = self._voice_output_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._voice_output_locks[guild_id] = lock
+        return lock
+
+    async def _acquire_voice_output(self, guild_id: int) -> None:
+        lock = self._voice_output_lock(guild_id)
+        if lock.locked():
+            logger.debug(
+                "Queuing voice output for guild=%s (playback in progress)",
+                guild_id,
+            )
+        await lock.acquire()
+
+    def _release_voice_output(self, guild_id: int) -> None:
+        lock = self._voice_output_locks.get(guild_id)
+        if lock is None:
+            return
+        try:
+            lock.release()
+        except RuntimeError:
+            logger.debug(
+                "Voice output lock for guild=%s was not held",
+                guild_id,
+            )
+
+    def _release_streaming_voice_output(self, handle: Optional[StreamingTTSHandle]) -> None:
+        if handle is None or not getattr(handle, "_voice_output_locked", False):
+            return
+        handle._voice_output_locked = False
+        guild_id = getattr(handle, "guild_id", None)
+        if guild_id is not None:
+            self._release_voice_output(int(guild_id))
+
     def _guild_id_for_text_channel(self, chat_id: str) -> Optional[int]:
         for gid, text_ch_id in self._voice_text_channels.items():
             if str(text_ch_id) == str(chat_id):
@@ -4620,20 +4658,26 @@ class DiscordAdapter(BasePlatformAdapter):
         if mixer is None:
             return None
 
-        self._cancel_voice_timeout(guild_id)
-        speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
-        child = mixer.start_streaming_speech(
-            gain=speech_gain,
-            lead_silence=self._lead_silence_bytes(),
-        )
-        handle = StreamingTTSHandle(
-            chat_id=str(chat_id),
-            audio_format=audio_format,
-        )
-        handle.speech_child = child  # type: ignore[attr-defined]
-        handle.guild_id = guild_id  # type: ignore[attr-defined]
-        self._reset_voice_timeout(guild_id)
-        return handle
+        await self._acquire_voice_output(guild_id)
+        try:
+            self._cancel_voice_timeout(guild_id)
+            speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
+            child = mixer.start_streaming_speech(
+                gain=speech_gain,
+                lead_silence=self._lead_silence_bytes(),
+            )
+            handle = StreamingTTSHandle(
+                chat_id=str(chat_id),
+                audio_format=audio_format,
+            )
+            handle.speech_child = child  # type: ignore[attr-defined]
+            handle.guild_id = guild_id  # type: ignore[attr-defined]
+            handle._voice_output_locked = True  # type: ignore[attr-defined]
+            self._reset_voice_timeout(guild_id)
+            return handle
+        except Exception:
+            self._release_voice_output(guild_id)
+            raise
 
     async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> None:
         if handle is None or handle.aborted or not chunk:
@@ -4664,11 +4708,14 @@ class DiscordAdapter(BasePlatformAdapter):
         child = getattr(handle, "speech_child", None)
         guild_id = getattr(handle, "guild_id", None)
         mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if guild_id is not None else None
-        if interrupted and mixer is not None:
-            mixer.stop_speech()
-            return
-        if child is not None and mixer is not None:
-            mixer.finish_streaming_speech(child)
+        try:
+            if interrupted and mixer is not None:
+                mixer.stop_speech()
+                return
+            if child is not None and mixer is not None:
+                mixer.finish_streaming_speech(child)
+        finally:
+            self._release_streaming_voice_output(handle)
 
     async def abort_streaming_tts(self, handle: StreamingTTSHandle, error: Optional[str] = None) -> None:
         if handle is None:
@@ -4676,8 +4723,11 @@ class DiscordAdapter(BasePlatformAdapter):
         handle.aborted = True
         guild_id = getattr(handle, "guild_id", None)
         mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if guild_id is not None else None
-        if mixer is not None:
-            mixer.stop_speech()
+        try:
+            if mixer is not None:
+                mixer.stop_speech()
+        finally:
+            self._release_streaming_voice_output(handle)
 
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.
@@ -4765,6 +4815,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
                 self._voice_mixers.pop(guild_id, None)
+            self._voice_output_locks.pop(guild_id, None)
 
             vc = self._voice_clients.pop(guild_id, None)
             if vc and vc.is_connected():
@@ -4792,6 +4843,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not vc or not vc.is_connected():
             return False
 
+        await self._acquire_voice_output(guild_id)
         # Playback is activity. Do not let the inactivity timer disconnect the
         # bot while duration probing, decoding, or speaking; re-arm it when this
         # attempt finishes, even if decoding/playback raises.
@@ -4875,6 +4927,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     receiver.resume()
         finally:
             self._reset_voice_timeout(guild_id)
+            self._release_voice_output(guild_id)
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""

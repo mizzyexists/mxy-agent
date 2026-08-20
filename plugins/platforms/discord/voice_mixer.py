@@ -297,6 +297,11 @@ class VoiceMixer(discord.AudioSource):
         if not pcm:
             return
         with self._lock:
+            # Replace any in-flight speech rather than summing frames — concurrent
+            # callers should serialize at the adapter, but overlapping clips sound
+            # like cutoffs/garble when they mix.
+            if self._speech:
+                self._speech.clear()
             child = MixerChild(
                 "speech", pcm, loop=False,
                 gain=self._speech_gain if gain is None else float(gain),

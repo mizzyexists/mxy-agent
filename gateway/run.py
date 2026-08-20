@@ -22004,8 +22004,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state.session_key = session_key
         self._voice_defer_audio_sessions.add(session_key)
 
-        await self._flush_pending_voice_reply(session_key)
-
         logger.info(
             "Speculative voice turn guild=%s user=%s: %s",
             guild_id,

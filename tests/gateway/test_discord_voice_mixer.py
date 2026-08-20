@@ -7,6 +7,7 @@ integration (install on join, play routing, ack) is tested with the standard
 ``object.__new__(DiscordAdapter)`` helper used elsewhere in the voice suite.
 """
 
+import asyncio
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -51,6 +52,15 @@ class TestVoiceMixerCore:
         # discord.py sends raw PCM when is_opus() is False.
         assert vm.VoiceMixer().is_opus() is False
 
+    def test_play_speech_replaces_in_flight_clip(self):
+        mx = vm.VoiceMixer()
+        tone_a = (np.ones(vm.SAMPLES_PER_FRAME, dtype=np.int16) * 1000).tobytes()
+        tone_b = (np.ones(vm.SAMPLES_PER_FRAME, dtype=np.int16) * 500).tobytes()
+        mx.play_speech(tone_a * 10)
+        mx.play_speech(tone_b * 10)
+        frame = np.frombuffer(mx.read(), dtype=np.int16)
+        assert int(np.max(np.abs(frame))) <= 600
+
     def test_ambient_loops_and_is_quiet(self):
         mx = vm.VoiceMixer(ambient_gain=0.2)
         amb = vm.synth_ambient_pcm(seconds=0.5)
@@ -84,6 +94,7 @@ def _make_adapter(fx_cfg=None):
     adapter._voice_receivers = {}
     adapter._voice_listen_tasks = {}
     adapter._voice_mixers = {}
+    adapter._voice_output_locks = {}
     adapter._ambient_pcm_cache = None
     adapter._voice_fx_cfg = fx_cfg if fx_cfg is not None else {
         "enabled": True, "ambient_enabled": True, "ambient_path": "",
@@ -106,7 +117,7 @@ class TestVoiceMixerActive:
 
 
 class TestPlayInVoiceChannelMixerPath:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_routes_through_mixer_when_present(self):
         adapter = _make_adapter()
         vc = MagicMock()
@@ -127,6 +138,7 @@ class TestPlayInVoiceChannelMixerPath:
 
         mixer = _Mixer()
         adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
         adapter._reset_voice_timeout = MagicMock()
 
         fake_pcm = b"\x00" * vm.FRAME_SIZE
@@ -137,6 +149,41 @@ class TestPlayInVoiceChannelMixerPath:
         adapter._reset_voice_timeout.assert_called_once_with(111)
         # Legacy path must NOT have been used.
         vc.play.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_serializes_concurrent_playback(self):
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        adapter._voice_clients[111] = vc
+        adapter._cancel_voice_timeout = MagicMock()
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._playback_timeout_for_audio = AsyncMock(return_value=30.0)
+
+        order: list[int] = []
+
+        class _Mixer:
+            def __init__(self):
+                self._polls = 0
+
+            @property
+            def speech_active(self):
+                self._polls += 1
+                return self._polls < 2
+
+            def play_speech(self, *_args, **_kwargs):
+                order.append(len(order) + 1)
+
+        adapter._voice_mixers[111] = _Mixer()
+
+        with patch.object(vm, "decode_to_pcm", return_value=b"\x00" * vm.FRAME_SIZE):
+            await asyncio.gather(
+                adapter.play_in_voice_channel(111, "/tmp/first.mp3"),
+                adapter.play_in_voice_channel(111, "/tmp/second.mp3"),
+            )
+
+        assert order == [1, 2]
 
 
 class TestLeadSilence:
@@ -156,7 +203,7 @@ class TestLeadSilence:
 
 
 class TestPlayAckInVoice:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_noop_when_ack_disabled(self):
         adapter = _make_adapter({"ack_enabled": False})
         adapter._voice_mixers[111] = MagicMock()
